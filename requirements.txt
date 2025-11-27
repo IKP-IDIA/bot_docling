@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+requests
+pytesseract
+pypdfium2
+docling
+python-multipart
