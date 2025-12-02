@@ -2,25 +2,49 @@ import os
 import re
 import uuid
 import json
-import requests
-import pytesseract
-import pypdfium2 as pdfium
+import asyncio
 from datetime import datetime
-from fastapi import FastAPI, UploadFile, File
-from docling.document_converter import DocumentConverter
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
+import fitz  # PyMuPDF (ใช้สำหรับ Fallback กรณี Docling พลาด)
+from PIL import Image
+import io
+import google.generativeai as genai
+from docling.document_converter import DocumentConverter # นำ Docling กลับมา
 
-app = FastAPI()
+# ใช้ python-dotenv เพื่อโหลดค่าจากไฟล์ .env (ถ้ามี)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+app = FastAPI(title="Smart Doc Processor (Docling + Gemini)")
 
 # -------------------------------
-# Config (ใช้ ENV ของ Railway)
+# Config
 # -------------------------------
-MEILI_URL = os.getenv("MEILI_URL", "http://localhost:7700/indexes/documents/documents")
-OLLAMA_API = os.getenv("OLLAMA_API", "http://localhost:11434/api/generate")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:latest")
+# ⚠️⚠️⚠️ SECURE VERSION: ดึง Key จาก Environment Variable ⚠️⚠️⚠️
+# ห้ามใส่ Key จริงลงในไฟล์นี้ถ้าจะเอาขึ้น Git
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Tesseract (Linux → ไม่ต้องระบุ path)
-pytesseract.pytesseract.tesseract_cmd = "tesseract"
+# ตรวจสอบว่าใส่ Key หรือยัง
+if not GEMINI_API_KEY:
+    print("\n" + "="*60)
+    print("❌ CRITICAL ERROR: ไม่พบ GEMINI_API_KEY ใน Environment Variable")
+    print("   วิธีแก้ไข: สร้างไฟล์ .env และใส่ GEMINI_API_KEY=your_key_here")
+    print("="*60 + "\n")
+else:
+    # ตั้งค่า API เฉพาะเมื่อมี Key แล้ว
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+    except Exception as e:
+        print(f"Error configuring Gemini: {e}")
 
+MODEL_NAME = 'gemini-2.5-flash-preview-09-2025'
+model = genai.GenerativeModel(MODEL_NAME)
+
+MEILI_URL = "http://10.1.0.150:7700/indexes/documents/documents"
 
 # --------------------------------------------------
 # Utilities
@@ -31,19 +55,6 @@ def generate_keywords_from_filename(filename):
     words = re.split(r"[\s._-]+", name)
     return [w for w in words if not w.isdigit() and len(w) > 1]
 
-
-def ocr_pdf_tesseract(path):
-    pdf = pdfium.PdfDocument(path)
-    full_text = ""
-    for i, page in enumerate(pdf):
-        bitmap = page.render(scale=3)
-        pil_image = bitmap.to_pil()
-        page_text = pytesseract.image_to_string(pil_image, lang="tha+eng")
-        full_text += page_text + "\n"
-    pdf.close()
-    return full_text
-
-
 def check_filename_keywords(text, filename):
     keywords = generate_keywords_from_filename(filename)
     text_lower = text.lower()
@@ -52,96 +63,148 @@ def check_filename_keywords(text, filename):
             return "เนื้อหาสอดคล้อง"
     return "เนื้อหาไม่สอดคล้อง"
 
+def pdf_to_images(file_path):
+    """Fallback: แปลง PDF เป็นรูปภาพกรณี Docling อ่านไม่ออก"""
+    try:
+        doc = fitz.open(file_path)
+        images = []
+        for page in doc:
+            pix = page.get_pixmap(matrix=fitz.Matrix(300/72, 300/72))
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            images.append(img)
+        doc.close()
+        return images
+    except Exception as e:
+        print(f"Error converting PDF: {e}")
+        return []
 
-def classify_document(markdown_text: str) -> str:
-    prompt = f"""
-จำแนกเอกสารนี้เป็นประเภท:
+# --------------------------------------------------
+# Gemini Logic
+# --------------------------------------------------
+async def analyze_with_gemini(content, is_image=False):
+    """
+    ฟังก์ชันเดียวรองรับทั้ง Text (จาก Docling) และ Image (Fallback)
+    """
+    
+    # ป้องกันการเรียก API ถ้าไม่มี Key
+    if not GEMINI_API_KEY:
+        return {
+            "doc_type": "Config Error",
+            "extracted_info": "❌ Error: Server Environment Variable 'GEMINI_API_KEY' not set."
+        }
 
-1. ข้อมูลที่เกี่ยวข้องกับการประกอบธุรกิจ บัตรเครดิต  
-2. ทะเบียนผู้ถือหุ้นของบริษัทฉบับล่าสุด  
-3. เอกสารแสดงฐานะทางการเงิน  
-4. มติคณะกรรมการบริษัท / เอกสารอนุมัติ  
-5. โครงสร้างองค์กร  
-6. โครงสร้างกลุ่มธุรกิจ  
-7. นโยบายและคู่มือปฏิบัติงาน  
+    base_prompt = """
+    You are an intelligent document processing AI. Analyze the provided document content.
+    
+    Task 1: Classify the document into ONE of these categories:
+       1. ข้อมูลที่เกี่ยวข้องกับการประกอบธุรกิจ บัตรเครดิต
+       2. ทะเบียนผู้ถือหุ้นของบริษัทฉบับล่าสุด
+       3. เอกสารแสดงฐานะทางการเงิน
+       4. มติคณะกรรมการบริษัท / เอกสารอนุมัติ
+       5. โครงสร้างองค์กร
+       6. โครงสร้างกลุ่มธุรกิจ
+       7. นโยบายและคู่มือปฏิบัติงาน
+       (If unsure, use "Unknown")
 
-ตอบรูปแบบ "3. เอกสารแสดงฐานะทางการเงิน"
+    Task 2: Extract specific information based on the identified category:
+       - If Type 1: Extract "Time period for customer contact" (e.g., 09:00-17:00).
+       - If Type 2 or 6: Extract "Shareholder ratio" (e.g., 99.99%).
+       - If Type 3: Return "Financial Status Checked".
+       - If Type 4: Extract "License Number".
+       - Else: Return "No specific info".
 
-เนื้อหา:
-{markdown_text[:800]}
-"""
-    resp = requests.post(
-        OLLAMA_API,
-        json={"model": OLLAMA_MODEL, "prompt": prompt, "max_tokens": 50},
-        timeout=300
-    )
+    Output Requirements:
+    Return ONLY a valid JSON object with this structure:
+    {
+        "doc_type": "Number + Category Name",
+        "extracted_info": "..."
+    }
+    """
+    
+    try:
+        inputs = [base_prompt]
+        if is_image:
+            # content คือ list ของรูปภาพ
+            inputs.extend(content)
+        else:
+            # content คือ text markdown
+            inputs.append(f"\n\nDocument Content (Markdown):\n{content[:30000]}") # Limit text length if needed
 
-    raw = resp.text
-    combined = ""
-    for line in raw.splitlines():
-        try:
-            js = json.loads(line)
-            combined += js.get("response", "")
-        except:
-            combined += line
-
-    combined = combined.strip()
-    first_line = combined.splitlines()[0] if combined else ""
-    match = re.search(r"^\d+\.\s*.+$", first_line)
-    return match.group(0).strip() if match else first_line
-
-
-def extract_share_ratio(markdown):
-    pattern = r'(\d{1,3}(?:\.\d+)?\s*%)'
-    matches = re.findall(pattern, markdown)
-    return matches or "ไม่พบสัดส่วนผู้ถือหุ้น"
-
-
-def extract_license(markdown):
-    pattern = r'(ใบอนุญาต[^\n]+|License\s*No\.\s*\S+)'
-    matches = re.findall(pattern, markdown)
-    return matches or "ไม่พบ license"
-
-
-def extract_contact_time(markdown):
-    pattern = r'(เวลา\s*(?:โทร|ติดต่อ)[^\n:]*[:\s]*\d{1,2}:\d{2}-\d{1,2}:\d{2}|Contact time[^\n]*[:\s]*\d{1,2}:\d{2}-\d{1,2}:\d{2})'
-    matches = re.findall(pattern, markdown)
-    return matches or "ไม่พบช่วงเวลาติดต่อ"
-
+        response = await asyncio.to_thread(
+            model.generate_content,
+            inputs
+        )
+        
+        text_resp = response.text
+        # Clean JSON
+        if "```json" in text_resp:
+            text_resp = text_resp.split("```json")[1].split("```")[0].strip()
+        elif "```" in text_resp:
+            text_resp = text_resp.split("```")[1].split("```")[0].strip()
+            
+        return json.loads(text_resp)
+        
+    except Exception as e:
+        print(f"Gemini Processing Error: {e}")
+        return {
+            "doc_type": "Error",
+            "extracted_info": f"Error: {str(e)}"
+        }
 
 # --------------------------------------------------
 # MAIN PROCESS FUNCTION
 # --------------------------------------------------
-def process_pdf_to_meili(pdf_path: str, filename: str):
+async def process_pdf_logic(pdf_path: str, filename: str):
+    
+    # 0. Check Key First
+    if not GEMINI_API_KEY:
+         return {
+            "id": "ERROR",
+            "filename_only": filename,
+            "filename_check": "API Key Missing",
+            "doc_type": "Config Error",
+            "extracted_info": "❌ กรุณาตั้งค่า GEMINI_API_KEY ใน Environment Variable หรือไฟล์ .env",
+            "extraction_method": "-"
+        }
 
-    converter = DocumentConverter()
+    full_text = ""
+    ai_result = {}
+
+    # 1. พยายามใช้ Docling ก่อน (ตาม requirement)
     try:
-        result = converter.convert(pdf_path)
-        markdown_content = result.document.export_to_markdown()
+        print(f"Processing with Docling: {filename}")
+        converter = DocumentConverter()
+        # Docling convert เป็น blocking operation อาจจะช้าถ้าไฟล์ใหญ่
+        # รันใน thread เพื่อไม่ให้ block FastAPI
+        result = await asyncio.to_thread(converter.convert, pdf_path)
+        full_text = result.document.export_to_markdown()
+        
+        if not full_text.strip():
+            raise Exception("Docling returned empty text")
+            
+        # ถ้า Docling สำเร็จ -> ส่ง Text ให้ Gemini วิเคราะห์
+        ai_result = await analyze_with_gemini(full_text, is_image=False)
+        
+    except Exception as e:
+        print(f"Docling failed ({e}), switching to Gemini Vision Fallback...")
+        # 2. ถ้า Docling พลาด -> ใช้ Gemini Vision (ส่งรูปภาพ) แทน
+        images = pdf_to_images(pdf_path)
+        if images:
+            ai_result = await analyze_with_gemini(images, is_image=True)
+            full_text = "(Transcribed by Gemini Vision)" # กรณีนี้เราอาจจะไม่มี full text แบบละเอียดเท่า Docling
+        else:
+            ai_result = {"doc_type": "Error", "extracted_info": "Failed both Docling and Vision"}
 
-        if not markdown_content.strip():
-            raise Exception("ไม่มีข้อความจาก Markdown")
-        text_for_ai = markdown_content
+    # 3. รับผลลัพธ์
+    doc_type = ai_result.get("doc_type", "Unknown")
+    extracted_info = ai_result.get("extracted_info", "-")
 
-    except:
-        text_for_ai = ocr_pdf_tesseract(pdf_path)
+    # 4. เช็คชื่อไฟล์
+    filename_check = check_filename_keywords(full_text, filename)
 
-    filename_check = check_filename_keywords(text_for_ai, filename)
-    doc_type = classify_document(text_for_ai)
-
-    if doc_type.startswith("1"):
-        extracted_info = extract_contact_time(text_for_ai)
-    elif doc_type.startswith("2"):
-        extracted_info = extract_share_ratio(text_for_ai)
-    elif doc_type.startswith("3"):
-        extracted_info = "ตรวจเลขฐานการเงิน"
-    elif doc_type.startswith("4"):
-        extracted_info = extract_license(text_for_ai)
-    elif doc_type.startswith("6"):
-        extracted_info = extract_share_ratio(text_for_ai)
-    else:
-        extracted_info = "ไม่มีข้อมูลที่ต้องดึง"
-
+    # 5. เตรียม JSON Output
     doc_id = "DL" + str(uuid.uuid4())
     now_str = datetime.now().isoformat()
 
@@ -153,26 +216,34 @@ def process_pdf_to_meili(pdf_path: str, filename: str):
         "date": now_str,
         "filename_check": filename_check,
         "doc_type": doc_type,
-        "extracted_info": extracted_info
+        "extracted_info": extracted_info,
+        "extraction_method": "Docling" if full_text != "(Transcribed by Gemini Vision)" else "Gemini Vision"
     }
     return data
 
+# --------------------------------------------------
+# FastAPI Endpoints
+# --------------------------------------------------
 
 @app.post("/process-pdf")
 async def process_pdf(file: UploadFile = File(...)):
-    temp_path = f"temp_{uuid.uuid4()}.pdf"
-    with open(temp_path, "wb") as f:
+    
+    safe_filename = f"temp_{uuid.uuid4()}.pdf"
+    with open(safe_filename, "wb") as f:
         f.write(await file.read())
 
-    result = process_pdf_to_meili(temp_path, file.filename)
+    try:
+        result = await process_pdf_logic(safe_filename, file.filename)
+    finally:
+        if os.path.exists(safe_filename):
+            os.remove(safe_filename)
 
-    os.remove(temp_path)
     return result
 
 
 @app.get("/")
 def home():
     return {
-        "message": "FastAPI PDF → AI → MeiliSearch is running",
+        "message": "FastAPI Docling + Gemini Processor is running",
         "usage": "POST /process-pdf (upload PDF)"
     }
