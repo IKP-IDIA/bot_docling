@@ -6,7 +6,7 @@ import asyncio
 from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
-import fitz  # PyMuPDF (ใช้สำหรับ Fallback กรณี Docling พลาด)
+import fitz  # PyMuPDF (ใช้สำหรับ Fallback กรณี Docling พลาด - เฉพาะ PDF)
 from PIL import Image
 import io
 import google.generativeai as genai
@@ -156,7 +156,7 @@ async def analyze_with_gemini(content, is_image=False):
 # --------------------------------------------------
 # MAIN PROCESS FUNCTION
 # --------------------------------------------------
-async def process_pdf_logic(pdf_path: str, filename: str):
+async def process_document_logic(file_path: str, filename: str):
     
     # 0. Check Key First
     if not GEMINI_API_KEY:
@@ -171,14 +171,18 @@ async def process_pdf_logic(pdf_path: str, filename: str):
 
     full_text = ""
     ai_result = {}
+    extraction_method = "Unknown"
+    
+    # ตรวจสอบนามสกุลไฟล์
+    file_ext = os.path.splitext(filename)[1].lower()
 
-    # 1. พยายามใช้ Docling ก่อน (ตาม requirement)
+    # 1. พยายามใช้ Docling ก่อน (Docling รองรับ PDF, DOCX, XLSX, HTML, ฯลฯ)
     try:
         print(f"Processing with Docling: {filename}")
         converter = DocumentConverter()
         # Docling convert เป็น blocking operation อาจจะช้าถ้าไฟล์ใหญ่
         # รันใน thread เพื่อไม่ให้ block FastAPI
-        result = await asyncio.to_thread(converter.convert, pdf_path)
+        result = await asyncio.to_thread(converter.convert, file_path)
         full_text = result.document.export_to_markdown()
         
         if not full_text.strip():
@@ -186,16 +190,30 @@ async def process_pdf_logic(pdf_path: str, filename: str):
             
         # ถ้า Docling สำเร็จ -> ส่ง Text ให้ Gemini วิเคราะห์
         ai_result = await analyze_with_gemini(full_text, is_image=False)
+        extraction_method = "Docling"
         
     except Exception as e:
-        print(f"Docling failed ({e}), switching to Gemini Vision Fallback...")
-        # 2. ถ้า Docling พลาด -> ใช้ Gemini Vision (ส่งรูปภาพ) แทน
-        images = pdf_to_images(pdf_path)
-        if images:
-            ai_result = await analyze_with_gemini(images, is_image=True)
-            full_text = "(Transcribed by Gemini Vision)" # กรณีนี้เราอาจจะไม่มี full text แบบละเอียดเท่า Docling
+        print(f"Docling failed ({e})")
+        
+        # 2. Fallback Logic
+        # ถ้าเป็น PDF: ลองใช้ Gemini Vision (แปลงเป็นรูปภาพ)
+        if file_ext == '.pdf':
+            print("Switching to Gemini Vision Fallback (PDF only)...")
+            images = pdf_to_images(file_path)
+            if images:
+                ai_result = await analyze_with_gemini(images, is_image=True)
+                full_text = "(Transcribed by Gemini Vision)"
+                extraction_method = "Gemini Vision"
+            else:
+                ai_result = {"doc_type": "Error", "extracted_info": "Failed both Docling and Vision"}
+                extraction_method = "Failed"
         else:
-            ai_result = {"doc_type": "Error", "extracted_info": "Failed both Docling and Vision"}
+            # ถ้าเป็น DOCX/XLSX: ไม่มี Fallback Vision ง่ายๆ (ต้องใช้ LibreOffice ซึ่งยุ่งยาก)
+            ai_result = {
+                "doc_type": "Error", 
+                "extracted_info": f"Docling failed for {file_ext} file and no image fallback available."
+            }
+            extraction_method = "Failed"
 
     # 3. รับผลลัพธ์
     doc_type = ai_result.get("doc_type", "Unknown")
@@ -211,13 +229,13 @@ async def process_pdf_logic(pdf_path: str, filename: str):
     data = {
         "id": doc_id,
         "filename_only": filename,
-        "file_path": pdf_path,
-        "folder_path": os.path.dirname(pdf_path),
+        "file_path": file_path,
+        "folder_path": os.path.dirname(file_path),
         "date": now_str,
         "filename_check": filename_check,
         "doc_type": doc_type,
         "extracted_info": extracted_info,
-        "extraction_method": "Docling" if full_text != "(Transcribed by Gemini Vision)" else "Gemini Vision"
+        "extraction_method": extraction_method
     }
     return data
 
@@ -225,25 +243,38 @@ async def process_pdf_logic(pdf_path: str, filename: str):
 # FastAPI Endpoints
 # --------------------------------------------------
 
-@app.post("/process-pdf")
-async def process_pdf(file: UploadFile = File(...)):
+# Endpoint ใหม่ รองรับทุกไฟล์
+@app.post("/process-document")
+async def process_document(file: UploadFile = File(...)):
     
-    safe_filename = f"temp_{uuid.uuid4()}.pdf"
+    # ตรวจสอบนามสกุลไฟล์เบื้องต้น
+    allowed_extensions = ['.pdf', '.docx', '.xlsx']
+    file_ext = os.path.splitext(file.filename)[1].lower()
+    
+    if file_ext not in allowed_extensions:
+         raise HTTPException(status_code=400, detail=f"Unsupported file type. Allowed: {allowed_extensions}")
+
+    safe_filename = f"temp_{uuid.uuid4()}{file_ext}"
     with open(safe_filename, "wb") as f:
         f.write(await file.read())
 
     try:
-        result = await process_pdf_logic(safe_filename, file.filename)
+        result = await process_document_logic(safe_filename, file.filename)
     finally:
         if os.path.exists(safe_filename):
             os.remove(safe_filename)
 
     return result
 
+# Endpoint เก่า (เก็บไว้เพื่อ Backward Compatibility)
+@app.post("/process-pdf")
+async def process_pdf(file: UploadFile = File(...)):
+    return await process_document(file)
+
 
 @app.get("/")
 def home():
     return {
-        "message": "FastAPI Docling + Gemini Processor is running",
-        "usage": "POST /process-pdf (upload PDF)"
+        "message": "FastAPI Smart Doc Processor (PDF, DOCX, XLSX) is running",
+        "usage": "POST /process-document (upload file)"
     }
