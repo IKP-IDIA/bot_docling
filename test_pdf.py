@@ -5,6 +5,7 @@ import json
 import asyncio
 from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 import fitz  # PyMuPDF (ใช้สำหรับ Fallback กรณี Docling พลาด - เฉพาะ PDF)
 from PIL import Image
@@ -19,7 +20,7 @@ try:
 except ImportError:
     pass
 
-app = FastAPI(title="Smart Doc Processor (Docling + Gemini)")
+router = APIRouter()
 
 # -------------------------------
 # Config
@@ -244,7 +245,7 @@ async def process_document_logic(file_path: str, filename: str):
 # --------------------------------------------------
 
 # Endpoint ใหม่ รองรับทุกไฟล์
-@app.post("/process-document")
+@router.post("/process-document")
 async def process_document(file: UploadFile = File(...)):
     
     # ตรวจสอบนามสกุลไฟล์เบื้องต้น
@@ -267,12 +268,12 @@ async def process_document(file: UploadFile = File(...)):
     return result
 
 # Endpoint เก่า (เก็บไว้เพื่อ Backward Compatibility)
-@app.post("/process-pdf")
+@router.post("/process-pdf")
 async def process_pdf(file: UploadFile = File(...)):
     return await process_document(file)
 
 
-@app.get("/")
+@router.get("/")
 def home():
     return {
         "message": "FastAPI Smart Doc Processor (PDF, DOCX, XLSX) is running",

@@ -4,6 +4,7 @@ import re
 import asyncio
 import os
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from PIL import Image
 import fitz  # PyMuPDF
@@ -16,7 +17,7 @@ try:
 except ImportError:
     pass
 
-app = FastAPI(title="OrgChart OCR API (Gemini 2.5 Flash)")
+router = APIRouter()
 
 # --- CONFIGURATION ---
 # ⚠️⚠️⚠️ SECURE VERSION: ดึง Key จาก Environment Variable ⚠️⚠️⚠️
@@ -235,7 +236,7 @@ async def process_file_async(file_bytes: bytes, filename):
 # ----------------------------
 # API Endpoints
 # ----------------------------
-@app.post("/process-org-chart")
+@router.post("/process-org-chart")
 async def process_org_chart_endpoint(file: UploadFile = File(...)):
     """Endpoint สำหรับรับไฟล์ Org Chart (PDF/Image)"""
     if not file.filename:
@@ -255,6 +256,6 @@ async def process_org_chart_endpoint(file: UploadFile = File(...)):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {type(e).__name__}: {str(e)}")
 
-@app.get("/health")
+@router.get("/health")
 async def health():
     return {"status": "ok", "ocr_model": MODEL_NAME}
